@@ -12,6 +12,7 @@ import { fetchEvalRules } from "../evaluation/fetchEvalRules";
 import {
   createEvalSchedulerDeps,
   scheduleEvals,
+  type EvalSchedulerDeps,
 } from "../evaluation/scheduleEvals";
 import {
   isTraceDispatchSampled,
@@ -23,7 +24,6 @@ import {
   type OtelMediaPresence,
 } from "../otel-media/processOtelMedia";
 import type { IngestionService } from "../../services/IngestionService";
-import type { EvalSchedulerDeps } from "../evaluation/scheduleEvals";
 import { isEventsDispatchEnabled } from "../eventsDispatch/config";
 
 type ProcessOtelEventsParams = {
@@ -79,7 +79,6 @@ export async function processOtelEvents({
   const rules = await fetchRules(projectId, {
     includeTraceTranscriptRules,
   }).catch((error) => {
-    otelProcessingHooks.getStore()?.onFailure?.("eval-rules");
     traceException(error);
     logger.warn(`Failed to fetch eval rules for project ${projectId}`, error);
     return { observationRules: [], traceTranscriptRules: [] };
@@ -121,9 +120,6 @@ export async function processOtelEvents({
   let schedulerDeps: EvalSchedulerDeps | null = null;
   if (scheduling?.scheduler) {
     schedulerDeps = scheduling.scheduler({
-      projectId,
-      rules,
-      traceDispatchSamplingRate,
       enabled: needsScheduler,
       hasRows: eventInputs.length > 0,
       defaultCreate: () => createEvalSchedulerDeps(projectId, rules),

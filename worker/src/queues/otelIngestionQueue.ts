@@ -615,15 +615,28 @@ export const otelIngestionQueueProcessorBuilder = (
       const eventStorage = getS3EventStorageClient(
         env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
       );
+      const writesEvents = v4WritesToEventsTable(env);
       const retainNativeBatch =
         earlyMediaEnabled &&
         env.LANGFUSE_OTEL_DIRECT_IMPLEMENTATION === "rust" &&
-        v4WritesToEventsTable(env);
+        writesEvents;
       const writesToLegacyTables = v4WritesToLegacyTables(env);
       // Priority 0: deployment-level override.
       //   LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR=direct forces every batch
       //   onto the direct events_full path regardless of SDK headers/scopes.
       const envForcesDirect = v4ForceDirectOtelWrite(env);
+      const headerBasedDirectWrite = checkHeaderBasedDirectWrite({
+        sdkName: job.data.payload.sdkName,
+        sdkVersion: job.data.payload.sdkVersion,
+        ingestionVersion: job.data.payload.ingestionVersion,
+      });
+      const nativeContext = () => ({
+        projectId,
+        fileKey,
+        now: new Date().toISOString(),
+        isLangfuseInternal,
+        ...attribution,
+      });
       const needsTypeScriptSpans =
         !retainNativeBatch || writesToLegacyTables || !envForcesDirect;
       let parsedSpans: ResourceSpan[] | undefined;
@@ -780,12 +793,6 @@ export const otelIngestionQueueProcessorBuilder = (
       //
       // Priority 3 (last resort): the owning organization signed up past the
       //   Cloud direct-write cutoff. Non-Langfuse-SDK exports only (see below).
-      const headerBasedDirectWrite = checkHeaderBasedDirectWrite({
-        sdkName: job.data.payload.sdkName,
-        sdkVersion: job.data.payload.sdkVersion,
-        ingestionVersion: job.data.payload.ingestionVersion,
-      });
-
       // Evaluated whenever the higher-precedence header/env signals did not
       // already qualify, so the write_path label can attribute the decision
       // exactly and `direct_org_cutoff` counts only the traffic that rule
@@ -866,8 +873,7 @@ export const otelIngestionQueueProcessorBuilder = (
         );
         recordIncrement("langfuse.ingestion.otel.skipped_legacy_writes", 1);
       } else {
-        const shouldForwardToEventsTable =
-          !useDirectEventWrite && v4WritesToEventsTable(env);
+        const shouldForwardToEventsTable = !useDirectEventWrite && writesEvents;
 
         if (shouldProcessLegacyMedia) {
           // Process the exact normalized representation written by the legacy
@@ -924,19 +930,12 @@ export const otelIngestionQueueProcessorBuilder = (
         ]);
       }
 
-      const shouldWriteToEventsTable =
-        v4WritesToEventsTable(env) && useDirectEventWrite;
+      const shouldWriteToEventsTable = writesEvents && useDirectEventWrite;
       const processDirectOtelBatch = async () => {
         if (retainNativeBatch && earlyBatch && shouldWriteToEventsTable) {
           return processRustOtelEvents({
             batch: earlyBatch,
-            context: {
-              projectId,
-              fileKey,
-              now: new Date().toISOString(),
-              isLangfuseInternal,
-              ...attribution,
-            },
+            context: nativeContext(),
           });
         }
         if (!parsedSpans) {

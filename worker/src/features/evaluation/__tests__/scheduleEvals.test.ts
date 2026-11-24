@@ -7,6 +7,7 @@ import {
 import { Prisma } from "@langfuse/shared/src/db";
 import { logger, recordIncrement } from "@langfuse/shared/src/server";
 import { createEvalSchedulerDeps, scheduleEvals } from "../scheduleEvals";
+import { otelProcessingHooks } from "../../otel-ingestion/processingHooks";
 import type { EvalRules } from "../fetchEvalRules";
 import {
   createMockSchedulerDeps,
@@ -267,6 +268,7 @@ describe("scheduleEvals", () => {
     const error = new Error("Redis unavailable");
     mocks.record.mockRejectedValueOnce(error);
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const onFailure = vi.fn();
     try {
       const schedulerDeps = createEvalSchedulerDeps(projectId, {
         observationRules: [],
@@ -278,7 +280,12 @@ describe("scheduleEvals", () => {
         serializedEventBytes: 120,
       });
 
-      await expect(schedulerDeps.flushTraceActivity()).resolves.toBeUndefined();
+      await expect(
+        otelProcessingHooks.run({ onFailure }, () =>
+          schedulerDeps.flushTraceActivity(),
+        ),
+      ).resolves.toBeUndefined();
+      expect(onFailure).toHaveBeenCalledExactlyOnceWith("trace-flush");
       expect(warn).toHaveBeenCalledExactlyOnceWith(
         "Failed to record trace rule selections",
         { projectId, error },

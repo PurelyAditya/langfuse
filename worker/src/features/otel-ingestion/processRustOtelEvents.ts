@@ -129,7 +129,6 @@ function fetchSampledEvalRules(
       const evalConfigs = await resolveRules(projectId, {
         includeTraceTranscriptRules: sampledTraceIds.length > 0,
       }).catch((error) => {
-        otelProcessingHooks.getStore()?.onFailure?.("eval-rules");
         traceException(error);
         logger.warn(
           `Failed to fetch eval rules for project ${projectId}`,
@@ -344,9 +343,6 @@ async function writeRecordsAndScheduleEvals(
   let schedulerDeps: EvalSchedulerDeps | null = null;
   if (scheduling?.scheduler) {
     schedulerDeps = scheduling.scheduler({
-      projectId,
-      rules: evalConfigs,
-      traceDispatchSamplingRate,
       enabled: needsScheduler,
       hasRows: records.length > 0,
       defaultCreate: () => createEvalSchedulerDeps(projectId, evalConfigs),

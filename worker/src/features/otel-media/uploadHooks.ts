@@ -5,7 +5,7 @@ import {
 } from "@langfuse/shared";
 import { otelProcessingHooks } from "../otel-ingestion/processingHooks";
 
-export type OtelMediaUploadIdentity = {
+type OtelMediaUploadIdentity = {
   projectId: string;
   traceId: string;
   observationId?: string;
@@ -39,7 +39,9 @@ export type OtelMediaAssociationRequest = {
 export type OtelMediaHooks = {
   upload?: (
     request: OtelMediaUploadRequest,
-    primary: (request: OtelMediaUploadRequest) => Promise<OtelMediaUploadResult>,
+    primary: (
+      request: OtelMediaUploadRequest,
+    ) => Promise<OtelMediaUploadResult>,
   ) => Promise<OtelMediaUploadResult>;
   associate?: (
     request: OtelMediaAssociationRequest,

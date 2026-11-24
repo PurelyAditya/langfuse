@@ -211,7 +211,6 @@ async function uploadOverflowCandidate(
   mediaBucket: string,
 ): Promise<OverflowResult> {
   const { field, value, originalBytes } = candidate;
-
   const uploadResult = await uploadOtelMedia({
     projectId: eventRecord.project_id,
     traceId: eventRecord.trace_id,
@@ -258,7 +257,6 @@ async function uploadOverflowCandidate(
         metricTags,
       );
     }
-
     return null;
   });
   if (!uploadResult) {

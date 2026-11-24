@@ -27,16 +27,13 @@ import {
 import {
   associateOtelMedia,
   shouldRecordOtelMediaMetrics,
+  type OtelMediaUploadResult,
   uploadOtelMedia,
 } from "./uploadHooks";
 
 const MEDIA_PAGE_SIZE = 4_096;
 
-export type CachedMediaUpload = {
-  mediaId: string;
-  outcome: "uploaded" | "reused";
-  byteLength: number;
-};
+export type CachedMediaUpload = OtelMediaUploadResult;
 
 // Retain descriptor metadata and completed upload results for the batch's lifetime.
 // Decoded bodies and restored source strings stay local to each processing call.
@@ -119,6 +116,7 @@ export async function uploadExtractedMediaOnce(params: {
     sha256Hash,
     contentType,
   ].join("\u0000");
+
   const identity = {
     projectId,
     traceId,
@@ -128,6 +126,7 @@ export async function uploadExtractedMediaOnce(params: {
     origin: MediaAssociationOrigin.INGESTION_MEDIA_EXTRACTION,
     sha256Hash,
   } as const;
+
   const cache =
     mediaUploadCache.get(batch) ??
     new Map<string, Promise<CachedMediaUpload>>();
@@ -137,7 +136,7 @@ export async function uploadExtractedMediaOnce(params: {
   if (cached) {
     const result = await cached;
     const reused = { ...result, outcome: "reused" as const };
-    await associateOtelMedia({
+    return associateOtelMedia({
       identity,
       result: reused,
       associate: () =>
@@ -150,7 +149,6 @@ export async function uploadExtractedMediaOnce(params: {
           origin: MediaAssociationOrigin.INGESTION_MEDIA_EXTRACTION,
         }),
     });
-    return reused;
   }
 
   const uploadPromise = uploadOtelMedia({
