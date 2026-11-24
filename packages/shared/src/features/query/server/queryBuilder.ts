@@ -30,7 +30,11 @@ import {
   SCORES_LISTABLE_COUNT_VIEW,
 } from "../types";
 
-import { eventsObservationsView, getViewDeclaration } from "../dataModel";
+import {
+  billableUnitsView,
+  eventsObservationsView,
+  getViewDeclaration,
+} from "../dataModel";
 import { InvalidRequestError } from "../../../errors/InvalidRequestError";
 import { env } from "../../../env";
 import { conditionFromFilter } from "../../../query-ast/filterStateCodec";
@@ -73,6 +77,11 @@ import {
   type ObservationsDb,
   type QueryLevel,
 } from "./eventsObservationsRegistry";
+import {
+  billableUnitsDimension,
+  billableUnitsFilterCondition,
+  billableUnitsMeasure,
+} from "./billableUnitsRegistry";
 import { NULL_IF_EMPTY_RE } from "./nullIfEmptyFilter";
 import {
   compileEventsTraceAttributesSubquery,
@@ -2010,6 +2019,94 @@ export class QueryBuilder {
   }
 
   /**
+   * {@link build} for the billable-units view, on v1 and v2 alike, with the
+   * view's entries from `billableUnitsRegistry.ts`. Always single-level: the
+   * ledger has no per-unit id for the inner GROUP BY of a two-level query,
+   * and the measure counts distinct units itself. Tenancy adds the project
+   * condition. Throws `InvalidRequestError` for a filter on a column outside
+   * `BILLABLE_UNITS_FILTER_COLUMNS`.
+   */
+  private buildBillableUnits(
+    query: QueryType,
+    projectId: string,
+  ): { query: string; parameters: Record<string, unknown> } {
+    const view = billableUnitsView;
+    const appliedDimensions = this.mapDimensions(query.dimensions, view);
+    const appliedMetrics = this.mapMetrics(query.metrics, view);
+    const bucket = this.applyBucketingDimension(query, view);
+    this.validateFilters(query.filters, view);
+    const orderBy = this.validateAndProcessOrderBy(
+      query.orderBy,
+      appliedDimensions,
+      appliedMetrics,
+      bucket,
+    );
+    const fill = this.withFillRange(
+      bucket,
+      query.fromTimestamp,
+      query.toTimestamp,
+      query.orderBy,
+    );
+
+    let source = getClickhouseKysely().selectFrom("billable_events as b");
+    const sourceEb = expressionBuilder(source);
+    for (const filter of query.filters) {
+      source = source.where(
+        billableUnitsFilterCondition(sourceEb, conditionFromFilter(filter)),
+      );
+    }
+    source = source
+      .where("b.ingested_at", ">=", utcDateTime(new Date(query.fromTimestamp)))
+      .where("b.ingested_at", "<=", utcDateTime(new Date(query.toTimestamp)));
+
+    // select <dimensions>, <bucket>, <aggregation>(<measure>) … from <source>
+    return this.compileWithOuterClauses(
+      projectId,
+      {
+        groupBy: [
+          ...appliedDimensions.map((d) => aliasRef(this.dimensionAlias(d))),
+          ...(bucket.type === "none"
+            ? []
+            : [aliasRef(bucket.bucketDimensionAlias)]),
+        ],
+        orderBy,
+        fill,
+        rowLimit: this.chartConfig?.row_limit,
+      },
+      source.select((eb) => [
+        ...appliedDimensions.map((d) =>
+          billableUnitsDimension(d.name)(eb).as(this.dimensionAlias(d)),
+        ),
+        ...(bucket.type === "time"
+          ? [
+              timeBucket(bucket.granularity)
+                .bucket(eb.ref("b.ingested_at"))
+                .as(bucket.bucketDimensionAlias),
+            ]
+          : []),
+        ...(bucket.type === "entity"
+          ? [
+              billableUnitsDimension(bucket.field)(eb).as(
+                bucket.bucketDimensionAlias,
+              ),
+            ]
+          : []),
+        ...(appliedMetrics.length === 0
+          ? [eb.fn.countAll().as("count")]
+          : appliedMetrics.map((metric) =>
+              // `count` and `uniq` both run as `uniq`: the view's
+              // `aggregationOverrides` set `queryAggregation`.
+              this.astAggregate(
+                eb,
+                metric,
+                billableUnitsMeasure(metric.measureName)(eb),
+              ).as(`${metric.aggregation}_${metric.alias || metric.sql}`),
+            )),
+      ]),
+    );
+  }
+
+  /**
    * `select` with `… group by <dimensions>, <bucket> order by … [with fill …]
    * [limit n]`, compiled for `projectId`.
    */
@@ -2259,10 +2356,11 @@ export class QueryBuilder {
   }
 
   /**
-   * The ClickHouse SQL and parameters of `query` for `projectId`. The v2
-   * observations view compiles through the query AST
-   * ({@link buildEventsObservations}); every other view and version is
-   * assembled as SQL text ({@link buildSqlText}).
+   * The ClickHouse SQL and parameters of `query` for `projectId`. The
+   * billable-units view ({@link buildBillableUnits}) and the v2 observations
+   * view ({@link buildEventsObservations}) compile through the query AST;
+   * every other view and version is assembled as SQL text
+   * ({@link buildSqlText}).
    *
    * Errors: `InvalidRequestError` for a query the schema or the view rejects.
    */
@@ -2278,6 +2376,9 @@ export class QueryBuilder {
       );
     }
     const view = this.getViewDeclaration(query.view);
+    if (view === billableUnitsView) {
+      return this.buildBillableUnits(query, projectId);
+    }
     if (view === eventsObservationsView) {
       return this.buildEventsObservations(
         query,
