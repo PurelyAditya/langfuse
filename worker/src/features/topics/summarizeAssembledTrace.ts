@@ -14,6 +14,7 @@ import {
   instrumentAsync,
   isInternalEvalEnvironment,
   prepareAssembledTopicTranscript,
+  recordIncrement,
   renderStoredTopicText,
   TOPICS_TEXT_VERSION,
   type ExecutionIssue,
@@ -322,7 +323,13 @@ async function summarizeTraceFacets(params: {
     for (const facet of facets) outcome(facet, "empty_input", "rule");
     return undefined;
   }
-  const text = renderStoredTopicText(params.transcript, params.executionIssues);
+  const { text, reply } = renderStoredTopicText(
+    params.transcript,
+    params.executionIssues,
+  );
+  // How often runs end without a reply, per project via the span and overall via the counter.
+  getCurrentSpan()?.setAttribute("langfuse.topics.reply", reply ?? "omitted");
+  recordIncrement("langfuse.topics.reply", 1, { reply: reply ?? "omitted" });
   metrics.summaryInputCharacters("text", text.length);
   metrics.summaryInputEstimatedTokens(
     Math.ceil(text.length / charsPerToken(models.summary.model)),

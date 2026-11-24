@@ -4,7 +4,11 @@ import type {
   NormalizedMessage,
   NormalizedMessagePart,
 } from "../../utils/normalized-io";
-import { redactModelPayload, renderTranscript } from "./topics-renderer";
+import {
+  redactModelPayload,
+  renderTranscript,
+  type TopicReply,
+} from "./topics-renderer";
 import { topicsTranscriptConfig } from "./topics-renderer-config";
 import type { ExecutionIssue, Transcript } from "./types";
 
@@ -98,7 +102,7 @@ export function prepareAssembledTopicTranscript(
 }
 
 // Bump when the Topics text rendering changes what the summarizer sees.
-export const TOPICS_TEXT_VERSION = "topics-text-v3";
+export const TOPICS_TEXT_VERSION = "topics-text-v4";
 
 // No per-block caps; only the summary input limit bounds the text.
 const UNCAPPED = Number.MAX_SAFE_INTEGER;
@@ -126,7 +130,7 @@ const UNCAPPED_TOPICS_CONFIG = {
 export function renderStoredTopicText(
   transcript: Transcript,
   executionIssues: ExecutionIssue[],
-): string {
+): { text: string; reply: TopicReply | null } {
   const issues = new Map(
     executionIssues.map((issue) => [issue.observationId, issue]),
   );
@@ -178,6 +182,10 @@ export function renderStoredTopicText(
       metadata: {},
     } as unknown as Observation;
   });
-  return renderTranscript(transcript, observations, UNCAPPED_TOPICS_CONFIG)
-    .text;
+  const { text, reply } = renderTranscript(
+    transcript,
+    observations,
+    UNCAPPED_TOPICS_CONFIG,
+  );
+  return { text, reply };
 }
