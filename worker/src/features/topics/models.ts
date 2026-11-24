@@ -18,6 +18,7 @@ import {
   getTopicTextResponseMetadata,
   topicMessages,
   type TopicPromptPart,
+  type TopicTextUsageDetails,
   type TopicsModel,
   type TopicsModels,
 } from "@langfuse/shared/topics/server";
@@ -29,7 +30,11 @@ import {
   type TopicProcessingConfig,
 } from "@langfuse/shared/topics";
 import { createEventLoopYielder } from "./event-loop";
-import { recordTopicModelCall, recordTopicTokenUsage } from "./metrics";
+import {
+  recordTopicModelCall,
+  recordTopicRequestBytes,
+  recordTopicTokenUsage,
+} from "./metrics";
 import {
   llmRequestEgressBytes,
   recordExportVolume,
@@ -96,27 +101,52 @@ export class TopicInputTooLarge extends Error {
   readonly name = "TopicInputTooLarge";
 }
 
+type TopicCallMetadata = Record<string, unknown> & {
+  source_trace_id?: string;
+  execution_id?: string | null;
+  rule_ids?: string[];
+  rule_id?: string | null;
+  run_id?: string;
+};
+
+// Characters per token by tokenizer family, measured on rendered Topics requests.
+export function charsPerToken(model: string) {
+  const name = model.toLowerCase();
+  if (/(^|[/.:])(gpt|o\d|chatgpt|text-embedding)/.test(name)) return 4.0;
+  if (name.includes("gemini")) return 4.0;
+  if (name.includes("claude")) return 3.2;
+  return 3.5;
+}
+
 /** One span, call counter and failure log per provider request. */
 async function topicModelCall<T>(
   stage: "summary" | "embedding" | "naming",
   model: TopicsModel,
   projectId: string,
   requestBytes: number,
-  context: Record<string, unknown>,
+  metadata: TopicCallMetadata | undefined,
   call: () => Promise<T>,
 ): Promise<T> {
   return instrumentAsync(
     { name: `topics.llm.${stage}`, traceScope: "topics" },
     async (span) => {
-      const fields: Record<string, string | number> = {
+      const fields: Record<string, string | number | string[]> = {
         "langfuse.topics.stage": stage,
         "langfuse.topics.model": model.model,
         "langfuse.topics.adapter": model.adapter,
         "langfuse.topics.request_bytes": requestBytes,
       };
-      for (const [key, value] of Object.entries(context))
-        if (typeof value === "string") fields[`langfuse.topics.${key}`] = value;
+      const identifiers = {
+        trace_id: metadata?.source_trace_id,
+        execution_id: metadata?.execution_id,
+        rule_ids: metadata?.rule_ids,
+        rule_id: metadata?.rule_id,
+        run_id: metadata?.run_id,
+      };
+      for (const [key, value] of Object.entries(identifiers))
+        if (value != null) fields[`langfuse.topics.${key}`] = value;
       span.setAttributes(fields);
+      recordTopicRequestBytes(stage, model.adapter, requestBytes);
       try {
         const result = await call();
         recordTopicModelCall(stage, model.adapter, {});
@@ -164,19 +194,29 @@ async function structuredCall<T>(
   stage: "summary" | "naming",
   model: TopicsModel,
   projectId: string,
-  metadata?: Record<string, unknown>,
+  metadata?: TopicCallMetadata,
   traceName = `topics-${stage}`,
+  onCost?: (costDetails: Record<string, number>) => void,
 ): Promise<ModelResult<T>> {
+  async function priceResponse(response: TopicTextUsageDetails) {
+    const priced = await priceTopicUsage(
+      stage,
+      model,
+      projectId,
+      response.usageDetails,
+      response.providedCostDetails,
+    );
+    if (onCost && Object.keys(priced.costDetails).length > 0)
+      onCost(priced.costDetails);
+    return priced;
+  }
   const trace = await topicTraceSink(traceName, projectId, metadata);
   const result = await topicModelCall(
     stage,
     model,
     projectId,
     llmRequestEgressBytes(topicMessages({ system, input }), schema),
-    {
-      trace_id: metadata?.source_trace_id,
-      execution_id: metadata?.execution_id,
-    },
+    metadata,
     () =>
       generateTopicText({
         model,
@@ -185,22 +225,20 @@ async function structuredCall<T>(
         schema,
         maxOutputTokens: outputLimit,
         trace,
+        onFailedResponseUsage: onCost
+          ? async (usage) => {
+              await priceResponse(usage);
+            }
+          : undefined,
       }),
   );
   recordTopicTokenUsage(stage, {
     input: result.usage.inputTokens,
     output: result.usage.outputTokens,
   });
-  return {
-    output: schema.parse(result.output),
-    ...(await priceTopicUsage(
-      stage,
-      model,
-      projectId,
-      result.usageDetails,
-      result.providedCostDetails,
-    )),
-  };
+  // A paid response can fail local validation during a naming retry.
+  const priced = await priceResponse(result);
+  return { output: schema.parse(result.output), ...priced };
 }
 
 async function topicTraceSink(
@@ -337,7 +375,7 @@ export async function summarizeTopicTraceFacets(
   facets: KeyedTopicFacet[],
   text: string,
   config: TopicProcessingConfig,
-  metadata?: Record<string, unknown>,
+  metadata?: TopicCallMetadata,
 ) {
   const { system, input, schema, maxOutputTokens } = buildTopicSummaryRequest(
     facets,
@@ -392,7 +430,7 @@ const namingSchema = z.object({
   evidenceSummaryIds: z.array(z.string()).min(1).max(3),
 });
 type NamingSummary = { id: string; summary: string };
-type NamingConflict = {
+export type NamingConflict = {
   name: string;
   description: string;
   summaries: string[];
@@ -651,8 +689,9 @@ export async function nameTopicGroup(
     facetName?: string;
     previousTopic?: { name: string; description: string };
   },
-  metadata?: Record<string, unknown>,
+  metadata: TopicCallMetadata & { run_id: string },
   conflict?: NamingConflict,
+  onCost?: (costDetails: Record<string, number>) => void,
 ) {
   const memberIds = new Set(group.members.map((member) => member.id));
   const schema = namingSchema.extend({
@@ -711,6 +750,7 @@ export async function nameTopicGroup(
       naming_input_tokens_estimated: inputLimit,
     },
     conflict ? "topics-naming-conflict" : undefined,
+    onCost,
   );
 }
 
@@ -720,6 +760,7 @@ export async function embedTopicSummaries(
   summaries: string[],
   dimensions: number,
   projectId: string,
+  metadata?: TopicCallMetadata,
 ): Promise<TopicModelUsage & { embeddings: number[][] }> {
   if (
     summaries.length === 0 ||
@@ -736,7 +777,7 @@ export async function embedTopicSummaries(
     model,
     projectId,
     llmRequestEgressBytes(summaries),
-    {},
+    metadata,
     () => generateTopicEmbeddings({ model, summaries, dimensions }),
   );
   recordTopicTokenUsage("embedding", { input: result.tokens });
