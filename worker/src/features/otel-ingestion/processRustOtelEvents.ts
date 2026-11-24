@@ -1,3 +1,4 @@
+import { otelProcessingHooks } from "./processingHooks";
 import type {
   EarlyOtelBatch,
   FinalizedOtelBatch,
@@ -41,6 +42,7 @@ import { encodeOtelLookups, type OtelLookupResult } from "./encodeOtelLookups";
 import {
   createEvalSchedulerDeps,
   scheduleEvals,
+  type EvalSchedulerDeps,
 } from "../evaluation/scheduleEvals";
 import {
   isTraceDispatchSampled,
@@ -48,6 +50,10 @@ import {
 } from "../traceDispatch/traceDispatchSampling";
 import { isEventsDispatchEnabled } from "../eventsDispatch/config";
 import type { OtelMediaPresence } from "../otel-media/processOtelMedia";
+import {
+  shouldRecordOtelMediaMetrics,
+  uploadOtelMedia,
+} from "../otel-media/uploadHooks";
 import {
   recordExtractedMediaUpload,
   uploadExtractedMediaOnce,
@@ -70,16 +76,27 @@ export async function processRustOtelEvents(params: {
 }): Promise<OtelMediaPresence> {
   const { batch, context } = params;
   const { projectId } = context;
-  const samplingRate = isEventsDispatchEnabled()
-    ? resolveTraceDispatchSamplingRate(projectId)
-    : Promise.resolve(0);
+  const scheduling = otelProcessingHooks.getStore()?.scheduling;
+  let samplingRate: Promise<number>;
+  if (isEventsDispatchEnabled()) {
+    const resolveSamplingRate =
+      scheduling?.samplingRate ?? resolveTraceDispatchSamplingRate;
+    samplingRate = resolveSamplingRate(projectId);
+  } else {
+    samplingRate = Promise.resolve(0);
+  }
   const prepared = await batch.process(context);
   const processing = prepared.batch;
   try {
     const [mediaResults, lookups, rules] = await waitForServiceWork([
       uploadRequestedMedia(batch, processing, prepared.mediaRequests, context),
       resolveLookups(prepared.lookupRequests, context),
-      fetchSampledEvalRules(projectId, prepared.traceIds, samplingRate),
+      fetchSampledEvalRules(
+        projectId,
+        prepared.traceIds,
+        samplingRate,
+        scheduling?.fetchRules,
+      ),
     ] as const);
     const finalized = await completeOrFinalizeBatch(
       processing,
@@ -99,6 +116,7 @@ function fetchSampledEvalRules(
   projectId: string,
   traceIds: string[],
   traceDispatchSamplingRatePromise: Promise<number>,
+  fetchRules?: typeof fetchEvalRules,
 ): Promise<EvalRuleResolution> {
   return traceDispatchSamplingRatePromise.then(
     async (traceDispatchSamplingRate) => {
@@ -107,9 +125,11 @@ function fetchSampledEvalRules(
       const sampledTraceIds = traceIds.filter((traceId) =>
         isTraceDispatchSampled(traceId, traceDispatchSamplingRate),
       );
-      const evalConfigs = await fetchEvalRules(projectId, {
+      const resolveRules = fetchRules ?? fetchEvalRules;
+      const evalConfigs = await resolveRules(projectId, {
         includeTraceTranscriptRules: sampledTraceIds.length > 0,
       }).catch((error) => {
+        otelProcessingHooks.getStore()?.onFailure?.("eval-rules");
         traceException(error);
         logger.warn(
           `Failed to fetch eval rules for project ${projectId}`,
@@ -185,6 +205,7 @@ async function uploadOverflowFields(
   await forEachMedia(requests, async (request) => {
     let reference: string | undefined;
     let outcome = "failed";
+    let uploadBoundaryStarted = false;
     try {
       const mediaBucket = env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET;
       if (!mediaBucket)
@@ -194,23 +215,36 @@ async function uploadOverflowFields(
         throw new Error("unsupported overflow field");
       const sha256Hash = request.sha256Hash;
       if (!sha256Hash) throw new Error("missing overflow media digest");
-      const result = await otelMediaUploads.run(request.byteLength, async () =>
-        uploadMediaForTrace({
-          projectId,
-          traceId: request.traceId,
-          observationId: request.observationId,
-          field,
-          contentType: MediaContentType.TXT,
-          contentBytes: await processing.overflowBody(request.index),
-          sha256Hash,
-          mediaBucket,
-          mediaPrefix: env.LANGFUSE_S3_MEDIA_UPLOAD_PREFIX,
-          origin: MediaAssociationOrigin.INGESTION_FIELD_OVERFLOW,
-        }),
-      );
+      uploadBoundaryStarted = true;
+      const result = await uploadOtelMedia({
+        projectId,
+        traceId: request.traceId,
+        observationId: request.observationId,
+        field,
+        contentType: MediaContentType.TXT,
+        origin: MediaAssociationOrigin.INGESTION_FIELD_OVERFLOW,
+        sha256Hash,
+        loadBody: () => processing.overflowBody(request.index),
+        admit: (work) => otelMediaUploads.run(request.byteLength, work),
+        upload: (contentBytes, capturedHash) =>
+          uploadMediaForTrace({
+            projectId,
+            traceId: request.traceId,
+            observationId: request.observationId,
+            field,
+            contentType: MediaContentType.TXT,
+            contentBytes,
+            sha256Hash: capturedHash ?? sha256Hash,
+            mediaBucket,
+            mediaPrefix: env.LANGFUSE_S3_MEDIA_UPLOAD_PREFIX,
+            origin: MediaAssociationOrigin.INGESTION_FIELD_OVERFLOW,
+          }),
+      });
       reference = `@@@langfuseMedia:type=text/plain|id=${result.mediaId}|source=field_size_limit@@@`;
       outcome = result.outcome;
     } catch (error) {
+      if (!uploadBoundaryStarted)
+        otelProcessingHooks.getStore()?.onFailure?.("media_upload");
       logger.warn(
         "Oversized observation field upload failed; persisting original field",
         {
@@ -221,17 +255,19 @@ async function uploadOverflowFields(
         },
       );
     }
-    recordIncrement("langfuse.ingestion.observation_field_overflow", 1, {
-      field: request.field,
-      outcome,
-    });
-    recordDistribution(
-      "langfuse.ingestion.observation_field_overflow.bytes_removed",
-      reference
-        ? Math.max(request.byteLength - Buffer.byteLength(reference), 0)
-        : 0,
-      { field: request.field, outcome },
-    );
+    if (shouldRecordOtelMediaMetrics()) {
+      recordIncrement("langfuse.ingestion.observation_field_overflow", 1, {
+        field: request.field,
+        outcome,
+      });
+      recordDistribution(
+        "langfuse.ingestion.observation_field_overflow.bytes_removed",
+        reference
+          ? Math.max(request.byteLength - Buffer.byteLength(reference), 0)
+          : 0,
+        { field: request.field, outcome },
+      );
+    }
     overflowResults[request.index] = { index: request.index, reference };
   });
   return overflowResults;
@@ -304,14 +340,27 @@ async function writeRecordsAndScheduleEvals(
 ): Promise<void> {
   const needsScheduler =
     evalConfigs.observationRules.length > 0 || sampledTraceIds.length > 0;
-  const schedulerDeps = needsScheduler
-    ? createEvalSchedulerDeps(projectId, evalConfigs)
-    : null;
+  const scheduling = otelProcessingHooks.getStore()?.scheduling;
+  let schedulerDeps: EvalSchedulerDeps | null = null;
+  if (scheduling?.scheduler) {
+    schedulerDeps = scheduling.scheduler({
+      projectId,
+      rules: evalConfigs,
+      traceDispatchSamplingRate,
+      enabled: needsScheduler,
+      hasRows: records.length > 0,
+      defaultCreate: () => createEvalSchedulerDeps(projectId, evalConfigs),
+    });
+  } else if (needsScheduler) {
+    schedulerDeps = createEvalSchedulerDeps(projectId, evalConfigs);
+  }
   const filterRows = schedulerDeps
     ? parseEvaluationFilterRows(evaluationFilterRows)
     : [];
-  const writer = ClickhouseWriter.getNativeInstance();
-  recordIngestionCounts(records);
+  const hooks = otelProcessingHooks.getStore();
+  const writer =
+    hooks?.getNativeWriter?.() ?? ClickhouseWriter.getNativeInstance();
+  if (hooks?.recordIngestionMetrics !== false) recordIngestionCounts(records);
   await Promise.all(
     records.map(async (record, index) => {
       const traceActivity = isTraceDispatchSampled(
@@ -340,7 +389,21 @@ async function writeRecordsAndScheduleEvals(
         : undefined;
 
       try {
-        writer.addToQueue(TableName.EventsFull, record.event);
+        if (hooks?.observeWrite) {
+          hooks.observeWrite(
+            {
+              traceId: record.traceId,
+              spanId: record.event.ids.id,
+              startTime: record.startTimeIso,
+            },
+            (onTerminal) =>
+              writer.addToQueue(TableName.EventsFull, record.event, {
+                onTerminal,
+              }),
+          );
+        } else {
+          writer.addToQueue(TableName.EventsFull, record.event);
+        }
         if (
           traceActivity &&
           matchedRuleIds !== undefined &&
@@ -381,6 +444,7 @@ async function uploadRequestedMedia(
   // across legacy and direct writes, linking each asset to both destinations.
   await forEachMedia(mediaRequests, async (request) => {
     let reference: string | undefined;
+    let uploadBoundaryStarted = false;
     try {
       const contentType = request.contentType;
       if (!isMediaContentType(contentType))
@@ -393,6 +457,7 @@ async function uploadRequestedMedia(
         throw new Error("unsupported media field");
       const sha256Hash = request.sha256Hash;
       if (!sha256Hash) throw new Error("missing extracted media digest");
+      uploadBoundaryStarted = true;
       const result = await uploadExtractedMediaOnce({
         batch,
         projectId,
@@ -419,6 +484,8 @@ async function uploadRequestedMedia(
         Math.max(0, request.originalByteLength - Buffer.byteLength(reference)),
       );
     } catch (error) {
+      if (!uploadBoundaryStarted)
+        otelProcessingHooks.getStore()?.onFailure?.("media_upload");
       recordExtractedMediaUpload("failed", request.kind, "direct");
       logger.warn(
         "Native OTEL media upload failed; keeping the original inline value",
@@ -433,16 +500,18 @@ async function uploadRequestedMedia(
     }
     mediaResults[request.index] = { index: request.index, reference };
   });
-  recordDistribution(
-    "langfuse.ingestion.otel.media.batch_byte_length",
-    mediaBytesProcessed,
-    { write_path: "direct", media_path: "early" },
-  );
-  recordDistribution(
-    "langfuse.ingestion.otel.media.processing_duration_ms",
-    Date.now() - mediaStartedAt,
-    { write_path: "direct", media_path: "early" },
-  );
+  if (shouldRecordOtelMediaMetrics()) {
+    recordDistribution(
+      "langfuse.ingestion.otel.media.batch_byte_length",
+      mediaBytesProcessed,
+      { write_path: "direct", media_path: "early" },
+    );
+    recordDistribution(
+      "langfuse.ingestion.otel.media.processing_duration_ms",
+      Date.now() - mediaStartedAt,
+      { write_path: "direct", media_path: "early" },
+    );
+  }
   return mediaResults;
 }
 
@@ -450,8 +519,11 @@ async function resolveLookups(
   lookupRequests: OtelLookupRequest[],
   { projectId, fileKey }: OtelProcessingContext,
 ): Promise<OtelLookupResult[]> {
-  const prompts = new PromptService(prisma, redis);
-  const skills = new SkillCacheService(prisma, redis);
+  const services = otelProcessingHooks.getStore()?.lookups;
+  const connection = services ? services.redis : redis;
+  const prompts = new PromptService(prisma, connection);
+  const skills = new SkillCacheService(prisma, connection);
+  const lookupModel = services?.findModel ?? findModel;
   const lookups: OtelLookupResult[] = [];
   // Resolve up to 64 lookup requests at a time; event payloads stay in Rust.
   for (let offset = 0; offset < lookupRequests.length; offset += 64) {
@@ -461,7 +533,7 @@ async function resolveLookups(
           try {
             const [matched, prompt, skillReferences] = await Promise.all([
               request.modelName
-                ? findModel({ projectId, model: request.modelName })
+                ? lookupModel({ projectId, model: request.modelName })
                 : { model: null, pricingTiers: [] },
               request.promptName && request.promptVersion
                 ? prompts.getPrompt({
@@ -498,6 +570,7 @@ async function resolveLookups(
               skillsResourceLoaded: skillReferences.skills_resource_loaded,
             };
           } catch (error) {
+            otelProcessingHooks.getStore()?.onFailure?.("lookup");
             traceException(error);
             logger.error(
               `Failed to create event record for project ${projectId} and observation ${request.spanId}`,

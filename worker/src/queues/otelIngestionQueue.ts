@@ -924,33 +924,27 @@ export const otelIngestionQueueProcessorBuilder = (
         ]);
       }
 
-      // Determine what processing is needed
       const shouldWriteToEventsTable =
         v4WritesToEventsTable(env) && useDirectEventWrite;
-      if (retainNativeBatch && earlyBatch && shouldWriteToEventsTable) {
-        const directMediaPresence = await processRustOtelEvents({
-          batch: earlyBatch,
-          context: {
-            projectId,
-            fileKey,
-            now: new Date().toISOString(),
-            isLangfuseInternal,
-            ingestionApiKey: attribution.ingestionApiKey,
-            ingestionSdkName: attribution.ingestionSdkName,
-            ingestionSdkVersion: attribution.ingestionSdkVersion,
-          },
-        });
-        mediaPresence = combineOtelMediaPresence(
-          mediaPresence,
-          directMediaPresence,
-        );
-      } else {
+      const processDirectOtelBatch = async () => {
+        if (retainNativeBatch && earlyBatch && shouldWriteToEventsTable) {
+          return processRustOtelEvents({
+            batch: earlyBatch,
+            context: {
+              projectId,
+              fileKey,
+              now: new Date().toISOString(),
+              isLangfuseInternal,
+              ...attribution,
+            },
+          });
+        }
         if (!parsedSpans) {
           throw new Error(
             "OTEL resource spans missing for TypeScript processing",
           );
         }
-        const directMediaPresence = await processOtelEvents({
+        return processOtelEvents({
           processor,
           resourceSpans: parsedSpans,
           ingestionService: getIngestionService(),
@@ -961,12 +955,13 @@ export const otelIngestionQueueProcessorBuilder = (
           mediaPath,
           inputByteLength,
         });
-        if (directMediaPresence) {
-          mediaPresence = combineOtelMediaPresence(
-            mediaPresence,
-            directMediaPresence,
-          );
-        }
+      };
+      const directMediaPresence = await processDirectOtelBatch();
+      if (directMediaPresence) {
+        mediaPresence = combineOtelMediaPresence(
+          mediaPresence,
+          directMediaPresence,
+        );
       }
     } catch (e) {
       const fileKey = job.data.payload.data.fileKey;

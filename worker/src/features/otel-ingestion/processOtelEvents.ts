@@ -1,3 +1,4 @@
+import { otelProcessingHooks } from "./processingHooks";
 import { restoreInlineMedia } from "../otel-media/resolveExtractedMedia";
 import type { EarlyOtelBatch } from "@langfuse/native";
 import { convertEventRecordToObservationForEval } from "@langfuse/shared";
@@ -22,6 +23,7 @@ import {
   type OtelMediaPresence,
 } from "../otel-media/processOtelMedia";
 import type { IngestionService } from "../../services/IngestionService";
+import type { EvalSchedulerDeps } from "../evaluation/scheduleEvals";
 import { isEventsDispatchEnabled } from "../eventsDispatch/config";
 
 type ProcessOtelEventsParams = {
@@ -63,16 +65,21 @@ export async function processOtelEvents({
   }
 
   // Trace recording requires direct events-table writes.
-  const traceDispatchSamplingRate =
-    shouldWriteToEventsTable && isEventsDispatchEnabled()
-      ? await resolveTraceDispatchSamplingRate(projectId)
-      : 0;
+  const scheduling = otelProcessingHooks.getStore()?.scheduling;
+  let traceDispatchSamplingRate = 0;
+  if (shouldWriteToEventsTable && isEventsDispatchEnabled()) {
+    const resolveSamplingRate =
+      scheduling?.samplingRate ?? resolveTraceDispatchSamplingRate;
+    traceDispatchSamplingRate = await resolveSamplingRate(projectId);
+  }
   const includeTraceTranscriptRules = eventInputs.some(({ traceId }) =>
     isTraceDispatchSampled(traceId, traceDispatchSamplingRate),
   );
-  const rules = await fetchEvalRules(projectId, {
+  const fetchRules = scheduling?.fetchRules ?? fetchEvalRules;
+  const rules = await fetchRules(projectId, {
     includeTraceTranscriptRules,
   }).catch((error) => {
+    otelProcessingHooks.getStore()?.onFailure?.("eval-rules");
     traceException(error);
     logger.warn(`Failed to fetch eval rules for project ${projectId}`, error);
     return { observationRules: [], traceTranscriptRules: [] };
@@ -111,9 +118,19 @@ export async function processOtelEvents({
     });
   }
 
-  const schedulerDeps = needsScheduler
-    ? createEvalSchedulerDeps(projectId, rules)
-    : null;
+  let schedulerDeps: EvalSchedulerDeps | null = null;
+  if (scheduling?.scheduler) {
+    schedulerDeps = scheduling.scheduler({
+      projectId,
+      rules,
+      traceDispatchSamplingRate,
+      enabled: needsScheduler,
+      hasRows: eventInputs.length > 0,
+      defaultCreate: () => createEvalSchedulerDeps(projectId, rules),
+    });
+  } else if (needsScheduler) {
+    schedulerDeps = createEvalSchedulerDeps(projectId, rules);
+  }
 
   await Promise.all(
     // Process each event independently
@@ -126,6 +143,7 @@ export async function processOtelEvents({
           fileKey,
         );
       } catch (error) {
+        otelProcessingHooks.getStore()?.onFailure?.("lookup");
         traceException(error);
         logger.error(
           `Failed to create event record for project ${eventInput.projectId} and observation ${eventInput.spanId}`,

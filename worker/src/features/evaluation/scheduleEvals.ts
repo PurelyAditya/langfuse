@@ -18,6 +18,7 @@ import {
   recordTraceActivity,
   type TraceSpanActivity,
 } from "../traceDispatch/traceRuleRecording";
+import { otelProcessingHooks } from "../otel-ingestion/processingHooks";
 
 /** Prepare rules and own the trace-activity buffer for one ingestion batch. */
 export function createEvalSchedulerDeps(projectId: string, rules: EvalRules) {
@@ -50,6 +51,7 @@ export function createEvalSchedulerDeps(projectId: string, rules: EvalRules) {
         traceActivity.length = 0;
       } catch (error) {
         outcome = "error";
+        otelProcessingHooks.getStore()?.onFailure?.("trace-flush");
         logger.warn("Failed to record trace rule selections", {
           projectId,
           error,

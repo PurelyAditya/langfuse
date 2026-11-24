@@ -70,6 +70,7 @@ import {
 } from "./aiGatewayAttribution";
 import { randomUUID } from "crypto";
 import { SpanKind } from "@opentelemetry/api";
+import { otelProcessingHooks } from "../../features/otel-ingestion/processingHooks";
 import { ClickhouseReadSkipCache } from "../../utils/clickhouseReadSkipCache";
 import { applyObservationFieldOverflow } from "../../features/observation-field-overflow/processObservationFieldOverflow";
 
@@ -500,7 +501,24 @@ export class IngestionService {
             "utf8",
           ),
         };
-    this.clickHouseWriter.addToQueue(TableName.EventsFull, recordToInsert);
+    const observe = otelProcessingHooks.getStore()?.observeWrite;
+    if (observe) {
+      observe(
+        {
+          traceId: recordToInsert.trace_id,
+          spanId: recordToInsert.span_id,
+          startTime: recordToInsert.start_time,
+        },
+        (onTerminal) =>
+          this.clickHouseWriter.addToQueue(
+            TableName.EventsFull,
+            recordToInsert,
+            { onTerminal },
+          ),
+      );
+    } else {
+      this.clickHouseWriter.addToQueue(TableName.EventsFull, recordToInsert);
+    }
     return recordToInsert;
   }
 

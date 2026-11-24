@@ -24,6 +24,11 @@ import {
   rewriteMediaValues,
   type MediaRegistry,
 } from "./mediaReferenceText";
+import {
+  associateOtelMedia,
+  shouldRecordOtelMediaMetrics,
+  uploadOtelMedia,
+} from "./uploadHooks";
 
 const MEDIA_PAGE_SIZE = 4_096;
 
@@ -114,6 +119,15 @@ export async function uploadExtractedMediaOnce(params: {
     sha256Hash,
     contentType,
   ].join("\u0000");
+  const identity = {
+    projectId,
+    traceId,
+    observationId,
+    field,
+    contentType,
+    origin: MediaAssociationOrigin.INGESTION_MEDIA_EXTRACTION,
+    sha256Hash,
+  } as const;
   const cache =
     mediaUploadCache.get(batch) ??
     new Map<string, Promise<CachedMediaUpload>>();
@@ -122,38 +136,41 @@ export async function uploadExtractedMediaOnce(params: {
   const cached = cache.get(key);
   if (cached) {
     const result = await cached;
-    await linkMediaToTraceOrObservation({
-      projectId,
-      traceId,
-      observationId,
-      mediaId: result.mediaId,
-      field,
-      origin: MediaAssociationOrigin.INGESTION_MEDIA_EXTRACTION,
-    });
-    return { ...result, outcome: "reused" };
-  }
-
-  const uploadPromise = otelMediaUploads.run(
-    params.byteLengthUpperBound,
-    async (): Promise<CachedMediaUpload> => {
-      const contentBytes = await loadBody();
-      return {
-        ...(await uploadMediaForTrace({
+    const reused = { ...result, outcome: "reused" as const };
+    await associateOtelMedia({
+      identity,
+      result: reused,
+      associate: () =>
+        linkMediaToTraceOrObservation({
           projectId,
           traceId,
           observationId,
+          mediaId: result.mediaId,
           field,
-          contentType,
-          contentBytes,
-          sha256Hash,
-          mediaBucket,
-          mediaPrefix,
           origin: MediaAssociationOrigin.INGESTION_MEDIA_EXTRACTION,
-        })),
-        byteLength: contentBytes.length,
-      };
-    },
-  );
+        }),
+    });
+    return reused;
+  }
+
+  const uploadPromise = uploadOtelMedia({
+    ...identity,
+    loadBody,
+    admit: (work) => otelMediaUploads.run(params.byteLengthUpperBound, work),
+    upload: (contentBytes, capturedHash) =>
+      uploadMediaForTrace({
+        projectId,
+        traceId,
+        observationId,
+        field,
+        contentType,
+        contentBytes,
+        sha256Hash: capturedHash ?? sha256Hash,
+        mediaBucket,
+        mediaPrefix,
+        origin: MediaAssociationOrigin.INGESTION_MEDIA_EXTRACTION,
+      }),
+  });
   cache.set(key, uploadPromise);
   try {
     return await uploadPromise;
@@ -300,6 +317,7 @@ export function recordExtractedMediaUpload(
   byteLength?: number,
   bytesRemoved = 0,
 ): void {
+  if (!shouldRecordOtelMediaMetrics()) return;
   const tags = {
     outcome,
     media_kind: kind,
