@@ -3289,9 +3289,9 @@ describe(
           "OTEL shadow batch differs or is incomplete",
           expect.anything(),
         );
-        const liveRust = await replay("early-rust");
+        const primaryRust = await replay("early-rust");
         expect(comparableOtelReplayRows(result.shadowRows)).toEqual(
-          comparableOtelReplayRows(liveRust.storedRows),
+          comparableOtelReplayRows(primaryRust.storedRows),
         );
       } finally {
         reports.mockRestore();
