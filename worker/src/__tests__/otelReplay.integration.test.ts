@@ -23,11 +23,18 @@ import {
   type ResourceSpan,
   uploadMediaForTrace,
 } from "@langfuse/shared/src/server";
+import * as sharedServer from "@langfuse/shared/src/server";
 import { prisma } from "@langfuse/shared/src/db";
 import * as masking from "@langfuse/shared/src/server/ee/ingestionMasking";
 import * as otelPreparation from "../features/otel-ingestion/prepareOtelBatch";
 import { initializeEventByteAccounting } from "../services/ClickhouseWriter/eventByteAccounting";
 import { ClickhouseWriter } from "../services/ClickhouseWriter";
+import { otelProcessingHooks } from "../features/otel-ingestion/processingHooks";
+import * as observationDeps from "../features/evaluation/observationEval/createSchedulerDeps";
+import {
+  createMockSchedulerDeps,
+  createTestEvalConfig,
+} from "../features/evaluation/observationEval/__tests__/fixtures";
 import {
   comparableOtelReplayRows,
   expectRawNativeParity,
@@ -3209,5 +3216,110 @@ describe(
         }
       },
     );
+
+    function replay(mode: "original-ts" | "early-rust") {
+      return runOneOtelReplay({
+        mode,
+        bytes: Buffer.from(JSON.stringify(buildResourceSpans())),
+        projectId: PROJECT_ID,
+        fileKey: FILE_KEY,
+        mediaUploadEnabled: true,
+        overflowEnabled: true,
+        overflowSizeLimitBytes: 256,
+        shadow: { sampleRate: mode === "original-ts" ? 1 : 0 },
+      });
+    }
+
+    it("replays a sampled batch once with matching stored rows and effects", async () => {
+      const { createEvalSchedulerDeps } = await vi.importActual<
+        typeof import("../features/evaluation/scheduleEvals")
+      >("../features/evaluation/scheduleEvals");
+      const { scheduleObservationEvals } = await vi.importActual<
+        typeof import("../features/evaluation/observationEval/scheduleObservationEvals")
+      >("../features/evaluation/observationEval/scheduleObservationEvals");
+      otelReplayMocks.createEvalSchedulerDeps.mockImplementation(
+        createEvalSchedulerDeps,
+      );
+      otelReplayMocks.scheduleObservationEvals.mockImplementation(
+        scheduleObservationEvals,
+      );
+      otelReplayMocks.fetchEvalRules.mockResolvedValue({
+        observationRules: [
+          createTestEvalConfig({
+            projectId: PROJECT_ID,
+            filter: [
+              {
+                column: "name",
+                type: "string",
+                operator: "=",
+                value: "replay-generation-with-media",
+              },
+            ],
+          }),
+        ],
+        traceTranscriptRules: [],
+      });
+      const effects = createMockSchedulerDeps();
+      const reports = vi.spyOn(sharedServer.logger, "info");
+      const dependencies = vi
+        .spyOn(observationDeps, "createObservationEvalSchedulerDeps")
+        .mockReturnValue(effects);
+      const sharedWriter = ClickhouseWriter.getInstance;
+      const startup = vi
+        .spyOn(ClickhouseWriter, "getInstance")
+        .mockImplementation((client) => {
+          expect(otelProcessingHooks.getStore()).toBeUndefined();
+          return sharedWriter(client);
+        });
+      try {
+        const result = await replay("original-ts");
+        expect(result.storedRows).toHaveLength(2);
+        expect(result.shadowRows).toHaveLength(2);
+        expect(comparableOtelReplayRows(result.shadowRows)).toEqual(
+          comparableOtelReplayRows(result.storedRows),
+        );
+        expect(otelReplayMocks.uploadMediaForTrace).toHaveBeenCalledTimes(2);
+        expect(otelReplayMocks.scheduleObservationEvals).toHaveBeenCalledTimes(
+          4,
+        );
+        expect(effects.enqueueEvalJob).toHaveBeenCalledTimes(1);
+        expect(effects.upsertJobExecution).toHaveBeenCalledTimes(1);
+        expect(effects.uploadObservationToS3).toHaveBeenCalledTimes(1);
+        expect(reports).not.toHaveBeenCalledWith(
+          "OTEL shadow batch differs or is incomplete",
+          expect.anything(),
+        );
+        const liveRust = await replay("early-rust");
+        expect(comparableOtelReplayRows(result.shadowRows)).toEqual(
+          comparableOtelReplayRows(liveRust.storedRows),
+        );
+      } finally {
+        reports.mockRestore();
+        dependencies.mockRestore();
+        startup.mockRestore();
+      }
+    });
+
+    it("preserves a primary exception during sampled replay", async () => {
+      const failure = new Error("synthetic TypeScript processing failure");
+      const reports = vi.spyOn(sharedServer.logger, "info");
+      const primary = vi
+        .spyOn(sharedServer.OtelIngestionProcessor.prototype, "processToEvent")
+        .mockImplementationOnce(() => {
+          throw failure;
+        });
+      try {
+        await expect(replay("original-ts")).rejects.toMatchObject({
+          cause: failure,
+        });
+        expect(reports).toHaveBeenCalledWith(
+          "OTEL shadow batch differs or is incomplete",
+          expect.objectContaining({ comparison: "primary_only_failure" }),
+        );
+      } finally {
+        reports.mockRestore();
+        primary.mockRestore();
+      }
+    });
   },
 );

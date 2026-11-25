@@ -73,3 +73,55 @@ Raw ingress limits and byte-length telemetry remain pre-media measurements. Trac
 `LANGFUSE_OTEL_DIRECT_IMPLEMENTATION=rust` selects Rust for direct events-table writes in projects admitted by the early-media selector. It requires early extraction; media uploads remain optional. Unselected projects keep the original TypeScript path. Legacy writes remain in TypeScript in dual-write mode; events-only Rust jobs skip constructing the TypeScript span graph. The Rust path retains the native media registry through normalization and service calls.
 
 Native errors reject the job without falling back to TypeScript processing.
+
+## Comparing TypeScript and Rust ingestion
+
+With TypeScript as the direct writer, `LANGFUSE_OTEL_NATIVE_SHADOW_SAMPLE_RATE` selects batches by project and source file. The default of `0` requires only the production tables. Use `0.001`, `0.01` and `0.05` for a 0.1%, 1% and 5% rollout. Each increase includes the earlier sample.
+
+The worker retains up to four accepted inputs totaling 64 MiB. Once the TypeScript writer acknowledges or drops its rows, the worker passes the post-masking input to the same `processRustOtelEvents` used when Rust is the live writer. Both runs resolve models, prompts and skills through their production services and evaluate the scheduling rules. The shadow uses the native writer with `events_native_test` as its destination. For uploads, evaluation writes and trace dispatch, the worker compares the requests and gives shadow Rust the outcome of the corresponding primary call. Primary exceptions still propagate to the ingestion queue.
+
+Before enabling sampling, create the shadow table in the ClickHouse database used by the ingestion writer. The example below is for an unreplicated installation. The clone inherits the event columns and their defaults. Apply future column changes to both tables.
+
+```sql
+CREATE TABLE events_native_test AS events_full
+ENGINE = ReplacingMergeTree(event_ts, is_deleted)
+PARTITION BY toDate(toTimeZone(created_at, 'UTC'))
+PRIMARY KEY (project_id, toStartOfMinute(start_time), xxHash32(trace_id))
+ORDER BY (project_id, toStartOfMinute(start_time), xxHash32(trace_id), span_id, start_time)
+SAMPLE BY xxHash32(trace_id)
+TTL toStartOfDay(toTimeZone(created_at, 'UTC')) + INTERVAL 1 DAY + INTERVAL 10 MINUTE DELETE
+SETTINGS
+    index_granularity_bytes = '64Mi',
+    merge_max_block_size_bytes = '64Mi',
+    enable_block_number_column = 1,
+    enable_block_offset_column = 1,
+    prewarm_mark_cache = 1,
+    prewarm_primary_key_cache = 1,
+    enable_full_text_index = 1,
+    ttl_only_drop_parts = 1;
+```
+
+The worker supplies `created_at` when it processes a batch, so backfilled spans land in the current UTC day. Each day's parts become eligible for expiry at 00:10 UTC the next day. The ten-minute grace covers ordinary verifier lag across midnight. ClickHouse removes expired parts asynchronously. Deleting a trace or project from the primary tables can still leave its full input, output and metadata in the shadow table until cleanup.
+
+After both writers settle, the worker buffers the acknowledged row keys in memory and checks them in the background. Graceful shutdown drains the buffer. A worker crash can lose outstanding comparisons. The `row_verification` metric counts keys skipped at capacity and keys left unverified after a read error.
+
+### Reading a comparison
+
+Metrics use the prefix `langfuse.ingestion.otel.shadow.`.
+
+- `pair` reports both terminal outcomes and the stage that failed. The discrepancy log includes inserted counts, handled failures by stage and up to three row keys.
+- The same log counts missing and extra service requests by kind. For an evaluation that matches, this includes the observation snapshot, execution record and queue request. For trace dispatch it compares trace IDs, start times and selected rules. Each path uses its own size estimate. Failed attempts count, so check the failure stages before attributing later missing requests.
+- The worker groups row checks by 64 MiB of sampled input and flushes smaller groups on a timer. One indexed query reads both tables for up to 64 keys. It compares every column except the three write-time clocks. Mismatch reports identify the row and changed columns, including maps that differ only in key order. They omit field values.
+- Compare `paired_processing_duration_ms` for successful events-only batches with the same primary media path. Both implementations use their production enrichment services and caches. Rust runs second and can benefit from caches warmed by TypeScript. The measurement excludes the buffered writer wait. Only TypeScript waits for real uploads and dispatches.
+
+Use a reported key in an authorized ClickHouse session to locate the original file. Query the side that stored the row and omit the span predicate if the example has no span ID. Multiple deliveries can return several file paths.
+
+```sql
+SELECT DISTINCT blob_storage_file_path
+FROM events_full
+WHERE project_id = {projectId:String}
+  AND toStartOfMinute(start_time) = toStartOfMinute({startTime:DateTime64(6, 'UTC')})
+  AND xxHash32(trace_id) = {traceHash:UInt32}
+  AND span_id = {spanId:String}
+  AND start_time = {startTime:DateTime64(6, 'UTC')}
+```
