@@ -19,6 +19,7 @@ export type TopicResult =
   | "applicable"
   | "not_applicable"
   | "insufficient_input"
+  | "empty_input"
   | "invalid_output"
   | "input_too_large"
   | "topics_found"
@@ -38,7 +39,7 @@ type TopicErrorReason =
   | "definition_readback"
   | "unknown";
 
-/** Who has to act on a failure. Topics builds the request and sets the size limits, so rejected or oversized input is ours. */
+/** Who has to act on a failure. Topics builds the request, so rejected input is ours; a trace over the size limit is the customer's. */
 export function topicFailureOwner(
   reason: string,
 ): "platform" | "upstream" | "customer" {
@@ -48,6 +49,7 @@ export function topicFailureOwner(
       "configuration",
       "rate_limit",
       "content_filter",
+      "input_too_large",
     ].includes(reason)
   )
     return "customer";
@@ -144,10 +146,15 @@ export class TopicMetrics {
   }
 
   /** Summary input size per format: the rendered text sent, and the JSON projection it replaced. */
-  summaryInputCharacters(format: "text" | "json", characters: number): void {
+  summaryInputCharacters(
+    format: "text" | "json",
+    characters: number,
+    overLimit?: boolean,
+  ): void {
     recordDistribution("langfuse.topics.summary_input_characters", characters, {
       ...this.tags,
       format,
+      ...(overLimit !== undefined && { over_limit: String(overLimit) }),
     });
   }
 
@@ -260,8 +267,9 @@ export class TopicMetrics {
       stage,
       reason,
       owner:
-        error instanceof TopicsProviderUnavailable
-          ? topicFailureOwner(error.reason)
+        error instanceof TopicsProviderUnavailable ||
+        reason === "input_too_large"
+          ? topicFailureOwner(reason)
           : "platform",
     });
   }
