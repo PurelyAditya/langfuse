@@ -80,26 +80,9 @@ With TypeScript as the direct writer, `LANGFUSE_OTEL_NATIVE_SHADOW_SAMPLE_RATE` 
 
 The worker retains up to four accepted inputs totaling 64 MiB. Once the TypeScript writer acknowledges or drops its rows, the worker passes the post-masking input to the same `processRustOtelEvents` that writes to `events_full` when `LANGFUSE_OTEL_DIRECT_IMPLEMENTATION=rust` selects Rust as the primary writer. Both runs resolve models, prompts and skills through their production services and evaluate the scheduling rules. The shadow uses the native writer with `events_native_test` as its destination. For uploads, evaluation writes and trace dispatch, the worker compares the requests and gives shadow Rust the outcome of the corresponding primary call. Primary exceptions still propagate to the ingestion queue.
 
-Before enabling sampling, create the shadow table in the ClickHouse database used by the ingestion writer. The example below is for an unreplicated installation. The clone inherits the event columns and their defaults. Apply future column changes to both tables.
+Before enabling sampling, run the [shadow table setup SQL](../../../../packages/shared/clickhouse/migrations/otel-shadow/0061.sql) in the ingestion writer's database. It clones the current event columns and defaults on an unreplicated installation.
 
-```sql
-CREATE TABLE events_native_test AS events_full
-ENGINE = ReplacingMergeTree(event_ts, is_deleted)
-PARTITION BY toDate(toTimeZone(created_at, 'UTC'))
-PRIMARY KEY (project_id, toStartOfMinute(start_time), xxHash32(trace_id))
-ORDER BY (project_id, toStartOfMinute(start_time), xxHash32(trace_id), span_id, start_time)
-SAMPLE BY xxHash32(trace_id)
-TTL toStartOfDay(toTimeZone(created_at, 'UTC')) + INTERVAL 1 DAY + INTERVAL 10 MINUTE DELETE
-SETTINGS
-    index_granularity_bytes = '64Mi',
-    merge_max_block_size_bytes = '64Mi',
-    enable_block_number_column = 1,
-    enable_block_offset_column = 1,
-    prewarm_mark_cache = 1,
-    prewarm_primary_key_cache = 1,
-    enable_full_text_index = 1,
-    ttl_only_drop_parts = 1;
-```
+When a forward migration changes those columns, add the corresponding SQL for existing shadow tables under [otel-shadow](../../../../packages/shared/clickhouse/migrations/otel-shadow), using the same version number. On installations with sampling enabled, pause sampling during the upgrade and apply the shadow SQL for the versions being crossed. CI creates the shadow table at version 0061 and compares its columns with `events_full` after applying the forward migrations.
 
 The worker supplies `created_at` when it processes a batch, so backfilled spans land in the current UTC day. Each day's parts become eligible for expiry at 00:10 UTC the next day. The ten-minute grace covers ordinary verifier lag across midnight. ClickHouse removes expired parts asynchronously. Deleting a trace or project from the primary tables can still leave its full input, output and metadata in the shadow table until cleanup.
 
