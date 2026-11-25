@@ -211,7 +211,17 @@ describe("scheduleEvals", () => {
       traceTranscriptRules: [facetRule],
     };
     const firstBatch = createEvalSchedulerDeps(projectId, rules);
-    const secondBatch = createEvalSchedulerDeps(projectId, rules);
+    const captured = vi.fn();
+    const secondBatch = otelProcessingHooks.run(
+      {
+        scheduling: {
+          recordTraceActivity: async (project, rows) => {
+            captured(project, structuredClone(rows));
+          },
+        },
+      },
+      () => createEvalSchedulerDeps(projectId, rules),
+    );
     const observation = createTestObservation({ name: "selected" });
     const matched = await Promise.all(
       [firstBatch, secondBatch].map((schedulerDeps, index) =>
@@ -254,7 +264,8 @@ describe("scheduleEvals", () => {
     expect(mocks.record).toHaveBeenCalledTimes(1);
 
     await secondBatch.flushTraceActivity();
-    expect(mocks.record).toHaveBeenNthCalledWith(2, projectId, [
+    expect(mocks.record).toHaveBeenCalledTimes(1);
+    expect(captured).toHaveBeenCalledExactlyOnceWith(projectId, [
       {
         traceId: "trace-1",
         spanStartTimeISO: startTimeISO,

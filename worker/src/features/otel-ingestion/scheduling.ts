@@ -1,13 +1,9 @@
-import type { fetchEvalRules } from "../evaluation/fetchEvalRules";
-import type { EvalSchedulerDeps } from "../evaluation/scheduleEvals";
-import type { resolveTraceDispatchSamplingRate } from "../traceDispatch/traceDispatchSampling";
+import type { ObservationEvalSchedulerDeps } from "../evaluation/observationEval/types";
+import type { recordTraceActivity } from "../traceDispatch/traceRuleRecording";
 
 export type OtelSchedulingHooks = {
-  fetchRules?: typeof fetchEvalRules;
-  samplingRate?: typeof resolveTraceDispatchSamplingRate;
-  scheduler?: (params: {
-    enabled: boolean;
-    hasRows: boolean;
-    defaultCreate: () => EvalSchedulerDeps;
-  }) => EvalSchedulerDeps | null;
+  observationWrites?: (
+    real: ObservationEvalSchedulerDeps,
+  ) => ObservationEvalSchedulerDeps;
+  recordTraceActivity?: typeof recordTraceActivity;
 };

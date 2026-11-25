@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { findModel, redis } from "@langfuse/shared/src/server";
 import type { ClickhouseWriter } from "../../services/ClickhouseWriter";
 import type { OtelMediaHooks } from "../otel-media/uploadHooks";
 import type { OtelSchedulingHooks } from "./scheduling";
@@ -12,7 +11,6 @@ export type OtelProcessingHooks = {
   scheduling?: OtelSchedulingHooks;
   onFailure?: (stage: string) => void;
   recordIngestionMetrics?: boolean;
-  lookups?: { redis: typeof redis; findModel: typeof findModel };
   getNativeWriter?: typeof ClickhouseWriter.getNativeInstance;
   observeWrite?: (
     row: RowKey,

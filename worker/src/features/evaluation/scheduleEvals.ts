@@ -36,8 +36,12 @@ export function createEvalSchedulerDeps(projectId: string, rules: EvalRules) {
     return [];
   });
 
+  const hooks = otelProcessingHooks.getStore()?.scheduling;
+  const realObservationDeps = createObservationEvalSchedulerDeps();
+  const observationDeps =
+    hooks?.observationWrites?.(realObservationDeps) ?? realObservationDeps;
   return {
-    ...createObservationEvalSchedulerDeps(),
+    ...observationDeps,
     traceTranscriptRules,
     collectTraceActivity: (activity: TraceSpanActivity): void => {
       traceActivity.push(activity);
@@ -47,7 +51,9 @@ export function createEvalSchedulerDeps(projectId: string, rules: EvalRules) {
       const startedAt = performance.now();
       let outcome = "success";
       try {
-        await recordTraceActivity(projectId, traceActivity);
+        const recordActivity =
+          hooks?.recordTraceActivity ?? recordTraceActivity;
+        await recordActivity(projectId, traceActivity);
         traceActivity.length = 0;
       } catch (error) {
         outcome = "error";
@@ -57,14 +63,16 @@ export function createEvalSchedulerDeps(projectId: string, rules: EvalRules) {
           error,
         });
       } finally {
-        recordIncrement("langfuse.trace_dispatch.recording_batches", 1, {
-          outcome,
-        });
-        recordDistribution(
-          "langfuse.trace_dispatch.recording_duration_ms",
-          performance.now() - startedAt,
-          { outcome, unit: "milliseconds" },
-        );
+        if (otelProcessingHooks.getStore()?.recordIngestionMetrics !== false) {
+          recordIncrement("langfuse.trace_dispatch.recording_batches", 1, {
+            outcome,
+          });
+          recordDistribution(
+            "langfuse.trace_dispatch.recording_duration_ms",
+            performance.now() - startedAt,
+            { outcome, unit: "milliseconds" },
+          );
+        }
       }
     },
   };

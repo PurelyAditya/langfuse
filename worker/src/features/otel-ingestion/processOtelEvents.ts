@@ -12,7 +12,6 @@ import { fetchEvalRules } from "../evaluation/fetchEvalRules";
 import {
   createEvalSchedulerDeps,
   scheduleEvals,
-  type EvalSchedulerDeps,
 } from "../evaluation/scheduleEvals";
 import {
   isTraceDispatchSampled,
@@ -65,18 +64,14 @@ export async function processOtelEvents({
   }
 
   // Trace recording requires direct events-table writes.
-  const scheduling = otelProcessingHooks.getStore()?.scheduling;
-  let traceDispatchSamplingRate = 0;
-  if (shouldWriteToEventsTable && isEventsDispatchEnabled()) {
-    const resolveSamplingRate =
-      scheduling?.samplingRate ?? resolveTraceDispatchSamplingRate;
-    traceDispatchSamplingRate = await resolveSamplingRate(projectId);
-  }
+  const traceDispatchSamplingRate =
+    shouldWriteToEventsTable && isEventsDispatchEnabled()
+      ? await resolveTraceDispatchSamplingRate(projectId)
+      : 0;
   const includeTraceTranscriptRules = eventInputs.some(({ traceId }) =>
     isTraceDispatchSampled(traceId, traceDispatchSamplingRate),
   );
-  const fetchRules = scheduling?.fetchRules ?? fetchEvalRules;
-  const rules = await fetchRules(projectId, {
+  const rules = await fetchEvalRules(projectId, {
     includeTraceTranscriptRules,
   }).catch((error) => {
     traceException(error);
@@ -117,16 +112,9 @@ export async function processOtelEvents({
     });
   }
 
-  let schedulerDeps: EvalSchedulerDeps | null = null;
-  if (scheduling?.scheduler) {
-    schedulerDeps = scheduling.scheduler({
-      enabled: needsScheduler,
-      hasRows: eventInputs.length > 0,
-      defaultCreate: () => createEvalSchedulerDeps(projectId, rules),
-    });
-  } else if (needsScheduler) {
-    schedulerDeps = createEvalSchedulerDeps(projectId, rules);
-  }
+  const schedulerDeps = needsScheduler
+    ? createEvalSchedulerDeps(projectId, rules)
+    : null;
 
   await Promise.all(
     // Process each event independently

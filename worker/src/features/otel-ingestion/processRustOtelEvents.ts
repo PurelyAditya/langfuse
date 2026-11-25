@@ -42,7 +42,6 @@ import { encodeOtelLookups, type OtelLookupResult } from "./encodeOtelLookups";
 import {
   createEvalSchedulerDeps,
   scheduleEvals,
-  type EvalSchedulerDeps,
 } from "../evaluation/scheduleEvals";
 import {
   isTraceDispatchSampled,
@@ -76,27 +75,16 @@ export async function processRustOtelEvents(params: {
 }): Promise<OtelMediaPresence> {
   const { batch, context } = params;
   const { projectId } = context;
-  const scheduling = otelProcessingHooks.getStore()?.scheduling;
-  let samplingRate: Promise<number>;
-  if (isEventsDispatchEnabled()) {
-    const resolveSamplingRate =
-      scheduling?.samplingRate ?? resolveTraceDispatchSamplingRate;
-    samplingRate = resolveSamplingRate(projectId);
-  } else {
-    samplingRate = Promise.resolve(0);
-  }
+  const samplingRate = isEventsDispatchEnabled()
+    ? resolveTraceDispatchSamplingRate(projectId)
+    : Promise.resolve(0);
   const prepared = await batch.process(context);
   const processing = prepared.batch;
   try {
     const [mediaResults, lookups, rules] = await waitForServiceWork([
       uploadRequestedMedia(batch, processing, prepared.mediaRequests, context),
       resolveLookups(prepared.lookupRequests, context),
-      fetchSampledEvalRules(
-        projectId,
-        prepared.traceIds,
-        samplingRate,
-        scheduling?.fetchRules,
-      ),
+      fetchSampledEvalRules(projectId, prepared.traceIds, samplingRate),
     ] as const);
     const finalized = await completeOrFinalizeBatch(
       processing,
@@ -116,7 +104,6 @@ function fetchSampledEvalRules(
   projectId: string,
   traceIds: string[],
   traceDispatchSamplingRatePromise: Promise<number>,
-  fetchRules?: typeof fetchEvalRules,
 ): Promise<EvalRuleResolution> {
   return traceDispatchSamplingRatePromise.then(
     async (traceDispatchSamplingRate) => {
@@ -125,8 +112,7 @@ function fetchSampledEvalRules(
       const sampledTraceIds = traceIds.filter((traceId) =>
         isTraceDispatchSampled(traceId, traceDispatchSamplingRate),
       );
-      const resolveRules = fetchRules ?? fetchEvalRules;
-      const evalConfigs = await resolveRules(projectId, {
+      const evalConfigs = await fetchEvalRules(projectId, {
         includeTraceTranscriptRules: sampledTraceIds.length > 0,
       }).catch((error) => {
         traceException(error);
@@ -339,17 +325,9 @@ async function writeRecordsAndScheduleEvals(
 ): Promise<void> {
   const needsScheduler =
     evalConfigs.observationRules.length > 0 || sampledTraceIds.length > 0;
-  const scheduling = otelProcessingHooks.getStore()?.scheduling;
-  let schedulerDeps: EvalSchedulerDeps | null = null;
-  if (scheduling?.scheduler) {
-    schedulerDeps = scheduling.scheduler({
-      enabled: needsScheduler,
-      hasRows: records.length > 0,
-      defaultCreate: () => createEvalSchedulerDeps(projectId, evalConfigs),
-    });
-  } else if (needsScheduler) {
-    schedulerDeps = createEvalSchedulerDeps(projectId, evalConfigs);
-  }
+  const schedulerDeps = needsScheduler
+    ? createEvalSchedulerDeps(projectId, evalConfigs)
+    : null;
   const filterRows = schedulerDeps
     ? parseEvaluationFilterRows(evaluationFilterRows)
     : [];
@@ -515,11 +493,8 @@ async function resolveLookups(
   lookupRequests: OtelLookupRequest[],
   { projectId, fileKey }: OtelProcessingContext,
 ): Promise<OtelLookupResult[]> {
-  const services = otelProcessingHooks.getStore()?.lookups;
-  const connection = services ? services.redis : redis;
-  const prompts = new PromptService(prisma, connection);
-  const skills = new SkillCacheService(prisma, connection);
-  const lookupModel = services?.findModel ?? findModel;
+  const prompts = new PromptService(prisma, redis);
+  const skills = new SkillCacheService(prisma, redis);
   const lookups: OtelLookupResult[] = [];
   // Resolve up to 64 lookup requests at a time; event payloads stay in Rust.
   for (let offset = 0; offset < lookupRequests.length; offset += 64) {
@@ -529,7 +504,7 @@ async function resolveLookups(
           try {
             const [matched, prompt, skillReferences] = await Promise.all([
               request.modelName
-                ? lookupModel({ projectId, model: request.modelName })
+                ? findModel({ projectId, model: request.modelName })
                 : { model: null, pricingTiers: [] },
               request.promptName && request.promptVersion
                 ? prompts.getPrompt({
