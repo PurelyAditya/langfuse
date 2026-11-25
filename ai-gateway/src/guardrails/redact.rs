@@ -13,7 +13,7 @@ use quick_cache::{
     Weighter,
     sync::{Cache, GuardResult},
 };
-use regex_automata::{Input, MatchKind, meta, nfa::thompson::WhichCaptures, util::syntax};
+use regex_automata::{Input, meta};
 
 pub(crate) const DEFAULT_REDACTION_LABEL: &str = "[REDACTED]";
 
@@ -71,18 +71,7 @@ pub(crate) fn redact_regex(pattern: &str) -> Option<Arc<meta::Regex>> {
 }
 
 fn compile_redact_regex(pattern: &str) -> Option<Arc<meta::Regex>> {
-    // Match the fast detection pass (`unicode(false).utf8(false)`) so negated
-    // ASCII boundary classes like `[^A-Za-z0-9_]` compile identically; span
-    // bounds are aligned to UTF-8 char boundaries before slicing.
-    meta::Builder::new()
-        .configure(
-            meta::Config::new()
-                .match_kind(MatchKind::LeftmostFirst)
-                .utf8_empty(false)
-                .which_captures(WhichCaptures::All),
-        )
-        .syntax(syntax::Config::new().unicode(false).utf8(false))
-        .build(pattern)
+    ai_gateway_guardrail_rules::compile_captures(pattern)
         .inspect_err(|error| tracing::warn!(%error, "redact guardrail pattern failed to compile"))
         .ok()
         .map(Arc::new)
