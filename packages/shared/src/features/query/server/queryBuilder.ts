@@ -2092,7 +2092,8 @@ export class QueryBuilder {
             ]
           : []),
         ...(appliedMetrics.length === 0
-          ? [eb.fn.countAll().as("count")]
+          ? // A unit has a ledger row per ingestion, so `count(*)` would count rows.
+            [uniq(billableUnitsMeasure("count")(eb)).as("count")]
           : appliedMetrics.map((metric) =>
               // `count` and `uniq` both run as `uniq`: the view's
               // `aggregationOverrides` set `queryAggregation`.
