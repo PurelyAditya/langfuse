@@ -118,12 +118,13 @@ function collectPresetSpans(
           regex.lastIndex += 1;
           continue;
         }
-        // When a pattern uses capture group 1 to exclude surrounding boundary chars (e.g. compressed IPv6),
-        // highlight only group 1 and resume right after it so adjacent tokens still match.
-        if (match[1] !== undefined) {
-          const offset = match[0].indexOf(match[1]);
+        // When a pattern uses named group `redact` to exclude surrounding boundary chars (e.g. compressed IPv6),
+        // highlight only that group and resume right after it so adjacent tokens still match.
+        const redactMatch = match.groups?.redact;
+        if (redactMatch !== undefined) {
+          const offset = match[0].indexOf(redactMatch);
           const start = match.index + Math.max(0, offset);
-          const end = start + match[1].length;
+          const end = start + redactMatch.length;
           spans.push([start, end]);
           regex.lastIndex = end;
           continue;

@@ -2099,8 +2099,9 @@ mod tests {
 
     #[test]
     fn boundary_wrapped_contains_and_prefix_patterns_redact_cleanly() {
-        let contains = r"(?:^|[^A-Za-z0-9_])((?:[Ff][Aa][Ll][Cc][Oo][Nn]))(?:$|[^A-Za-z0-9_])";
-        let prefix = r"(?:^|[^A-Za-z0-9_-])(acme_[A-Za-z0-9_-]{16,})(?:$|[^A-Za-z0-9_-])";
+        let contains =
+            r"(?:^|[^A-Za-z0-9_])(?<redact>(?:[Ff][Aa][Ll][Cc][Oo][Nn]))(?:$|[^A-Za-z0-9_])";
+        let prefix = r"(?:^|[^A-Za-z0-9_-])(?<redact>acme_[A-Za-z0-9_-]{16,})(?:$|[^A-Za-z0-9_-])";
         let body =
             r#"{"messages":[{"role":"user","content":"café Falcon鍵acme_1234567890abcdef🔑"}]}"#;
         let outcome = check_request(

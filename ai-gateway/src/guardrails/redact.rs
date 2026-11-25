@@ -13,7 +13,7 @@ use quick_cache::{
     Weighter,
     sync::{Cache, GuardResult},
 };
-use regex_automata::{Input, meta};
+use regex_automata::{Input, PatternID, meta};
 
 pub(crate) const DEFAULT_REDACTION_LABEL: &str = "[REDACTED]";
 
@@ -95,9 +95,11 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
 
 /// Appends every non-empty match span of `regex` in `text` to `out`.
 ///
-/// Patterns that use capture group 1 to exclude surrounding boundary characters
-/// (such as keyword lists, custom secret prefixes, and compressed IPv6) redact
-/// only group 1 and resume right after it so adjacent tokens still match.
+/// Patterns that use the named capture group `(?<redact>...)` to exclude
+/// surrounding boundary characters (such as keyword lists, custom secret
+/// prefixes, and compressed IPv6) redact only that group and resume right after
+/// it so adjacent tokens still match. All other patterns (including custom
+/// regexes with ordinary capturing groups) redact their full match.
 pub(crate) fn find_regex_spans<'a>(
     regex: &meta::Regex,
     text: &str,
@@ -105,6 +107,7 @@ pub(crate) fn find_regex_spans<'a>(
     label: &'a str,
     out: &mut Vec<RedactionSpan<'a>>,
 ) {
+    let redact_group = regex.group_info().to_index(PatternID::ZERO, "redact");
     let mut caps = regex.create_captures();
     let mut pos = 0usize;
     while pos <= text.len() {
@@ -113,8 +116,8 @@ pub(crate) fn find_regex_spans<'a>(
         let Some(full) = caps.get_match() else {
             break;
         };
-        let (raw_start, raw_end) = match caps.get_group(1) {
-            Some(group1) => (group1.start, group1.end),
+        let (raw_start, raw_end) = match redact_group.and_then(|group| caps.get_group(group)) {
+            Some(group) => (group.start, group.end),
             None => (full.start(), full.end()),
         };
         let start = floor_char_boundary(text, raw_start);
@@ -313,8 +316,9 @@ mod tests {
     }
 
     #[test]
-    fn capture_group_1_preserves_surrounding_boundaries_and_catches_adjacent_words() {
-        let pattern = r"(?:^|[^A-Za-z0-9_])((?:[Ff][Oo][Oo]|[Bb][Aa][Rr]))(?:$|[^A-Za-z0-9_])";
+    fn named_redact_group_preserves_surrounding_boundaries_and_catches_adjacent_words() {
+        let pattern =
+            r"(?:^|[^A-Za-z0-9_])(?<redact>(?:[Ff][Oo][Oo]|[Bb][Aa][Rr]))(?:$|[^A-Za-z0-9_])";
         let regex = redact_regex(pattern).unwrap();
         let text = "foo bar,foo! café foo日本語bar";
         let mut spans = Vec::new();
@@ -326,8 +330,20 @@ mod tests {
     }
 
     #[test]
+    fn custom_regex_with_capturing_groups_redacts_full_match() {
+        let regex = redact_regex(r"(ORD|INV)-\d{6}").unwrap();
+        let text = "Order ORD-123456 and INV-999999";
+        let mut spans = Vec::new();
+        find_regex_spans(&regex, text, 0, "[ORDER]", &mut spans);
+        assert_eq!(
+            apply_redactions(text, &mut spans).as_deref(),
+            Some("Order [ORDER] and [ORDER]")
+        );
+    }
+
+    #[test]
     fn regex_with_multibyte_utf8_never_splits_codepoints() {
-        let pattern = r"(?:^|[^A-Za-z0-9_-])(acme_[A-Za-z0-9_-]{16,})(?:$|[^A-Za-z0-9_-])";
+        let pattern = r"(?:^|[^A-Za-z0-9_-])(?<redact>acme_[A-Za-z0-9_-]{16,})(?:$|[^A-Za-z0-9_-])";
         let regex = redact_regex(pattern).unwrap();
         let text = "鍵acme_1234567890abcdef🔑";
         let mut spans = Vec::new();

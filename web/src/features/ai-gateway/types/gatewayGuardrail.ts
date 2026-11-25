@@ -53,8 +53,8 @@ export const GATEWAY_GUARDRAIL_PRESETS = {
       String.raw`\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b`,
       // IPv6 (full 8-group)
       String.raw`\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b`,
-      // IPv6 (compressed `::` form; capture group 1 holds the IP without surrounding boundary chars)
-      String.raw`(?:^|[^0-9A-Za-z_:])((?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|::(?:[0-9A-Fa-f]{1,4}:){0,6}[0-9A-Fa-f]{1,4})(?:$|[^0-9A-Za-z_:])`,
+      // IPv6 (compressed `::` form; named group `redact` holds the IP without surrounding boundary chars)
+      String.raw`(?:^|[^0-9A-Za-z_:])(?<redact>(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|::(?:[0-9A-Fa-f]{1,4}:){0,6}[0-9A-Fa-f]{1,4})(?:$|[^0-9A-Za-z_:])`,
     ],
   },
   aws_access_key_id: {
@@ -355,7 +355,7 @@ function escapeAsciiCaseInsensitive(literal: string) {
  */
 function compileSecretPrefixPattern(prefix: string): string {
   const escaped = escapeRegexLiteral(prefix);
-  return `(?:^|[^A-Za-z0-9_-])(${escaped}[A-Za-z0-9_-]{${GATEWAY_GUARDRAIL_SECRET_BODY_MIN_LENGTH},})(?:$|[^A-Za-z0-9_-])`;
+  return `(?:^|[^A-Za-z0-9_-])(?<redact>${escaped}[A-Za-z0-9_-]{${GATEWAY_GUARDRAIL_SECRET_BODY_MIN_LENGTH},})(?:$|[^A-Za-z0-9_-])`;
 }
 
 /**
@@ -368,7 +368,7 @@ function compileContainsPattern(words: readonly string[]): string | null {
   // Longest first so phrases win over shorter prefixes in leftmost-first engines.
   const sorted = [...deduped].sort((a, b) => b.length - a.length);
   const alternatives = sorted.map(escapeAsciiCaseInsensitive);
-  return `(?:^|[^A-Za-z0-9_])((?:${alternatives.join("|")}))(?:$|[^A-Za-z0-9_])`;
+  return `(?:^|[^A-Za-z0-9_])(?<redact>(?:${alternatives.join("|")}))(?:$|[^A-Za-z0-9_])`;
 }
 
 /** Parses newline-separated words/phrases and deduplicates case-insensitively. */
