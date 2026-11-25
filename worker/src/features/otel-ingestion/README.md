@@ -82,7 +82,7 @@ The worker retains up to four accepted inputs totaling 64 MiB. Once the TypeScri
 
 Before enabling sampling, run the [shadow table setup SQL](../../../../packages/shared/clickhouse/migrations/otel-shadow/0061.sql) in the ingestion writer's database. It clones the current event columns and defaults on an unreplicated installation.
 
-When a forward migration changes those columns, add the corresponding SQL for existing shadow tables under [otel-shadow](../../../../packages/shared/clickhouse/migrations/otel-shadow), using the same version number. On installations with sampling enabled, pause sampling during the upgrade and apply the shadow SQL for the versions being crossed. CI creates the shadow table at version 0061 and compares its columns with `events_full` after applying the forward migrations.
+When a forward migration changes those columns, add the corresponding SQL for existing shadow tables under [otel-shadow](../../../../packages/shared/clickhouse/migrations/otel-shadow), using the same version number. On installations with sampling enabled, pause sampling during the upgrade and apply the shadow SQL for the versions being crossed.
 
 The worker supplies `created_at` when it processes a batch, so backfilled spans land in the current UTC day. Each day's parts become eligible for expiry at 00:10 UTC the next day. The ten-minute grace covers ordinary verifier lag across midnight. ClickHouse removes expired parts asynchronously. Deleting a trace or project from the primary tables can still leave its full input, output and metadata in the shadow table until cleanup.
 
