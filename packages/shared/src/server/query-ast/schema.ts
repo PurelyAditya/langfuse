@@ -488,6 +488,7 @@ export const UNMODELED_COLUMNS: Record<
     "ingestion_sdk_name",
     "ingestion_sdk_version",
   ],
+  billable_events: ["event_time", "event_bytes"],
 };
 
 /**
